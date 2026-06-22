@@ -7,7 +7,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::hs_database::{BatchItem, BatchConsistencyResult};
+use crate::hs_database::{BatchItem, BatchConsistencyResult, ComplianceCheckResult, CccCheckResult, ProhibitedCheckResult};
 use crate::tax_calculator::{ErrorResponse, TaxCalculateRequest, TaxCalculator};
 
 #[derive(Debug, Serialize)]
@@ -65,6 +65,21 @@ async fn check_batch_consistency(Json(payload): Json<BatchConsistencyRequest>) -
     (StatusCode::OK, Json(serde_json::to_value(result).unwrap())).into_response()
 }
 
+async fn check_prohibited(Path(hs_code): Path<String>) -> impl IntoResponse {
+    let result: ProhibitedCheckResult = crate::hs_database::HsDatabase::check_prohibited(&hs_code);
+    (StatusCode::OK, Json(serde_json::to_value(result).unwrap())).into_response()
+}
+
+async fn check_ccc_cert(Path(hs_code): Path<String>) -> impl IntoResponse {
+    let result: CccCheckResult = crate::hs_database::HsDatabase::check_ccc_cert(&hs_code);
+    (StatusCode::OK, Json(serde_json::to_value(result).unwrap())).into_response()
+}
+
+async fn check_compliance(Path(hs_code): Path<String>) -> impl IntoResponse {
+    let result: ComplianceCheckResult = crate::hs_database::HsDatabase::check_compliance(&hs_code);
+    (StatusCode::OK, Json(serde_json::to_value(result).unwrap())).into_response()
+}
+
 pub fn create_router() -> Router {
     Router::new()
         .route("/health", get(health_check))
@@ -72,4 +87,7 @@ pub fn create_router() -> Router {
         .route("/api/category/lookup/:hs_code", get(lookup_category))
         .route("/api/categories", get(list_all_categories))
         .route("/api/batch/consistency-check", post(check_batch_consistency))
+        .route("/api/compliance/prohibited/:hs_code", get(check_prohibited))
+        .route("/api/compliance/ccc-cert/:hs_code", get(check_ccc_cert))
+        .route("/api/compliance/check/:hs_code", get(check_compliance))
 }

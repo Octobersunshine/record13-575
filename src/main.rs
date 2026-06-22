@@ -31,10 +31,13 @@ async fn main() {
     tracing::info!("Server starting, listening at: http://{}", addr);
     tracing::info!("Health check: http://{}/health", addr);
     tracing::info!("API Endpoints:");
-    tracing::info!("  POST http://{}/api/tax/calculate - Calculate comprehensive tax with classification risks", addr);
+    tracing::info!("  POST http://{}/api/tax/calculate - Calculate comprehensive tax with classification and compliance risks", addr);
     tracing::info!("  GET  http://{}/api/category/lookup/:hs_code - Smart classify with alternatives and risk detection", addr);
     tracing::info!("  GET  http://{}/api/categories - List all HS categories", addr);
     tracing::info!("  POST http://{}/api/batch/consistency-check - Check batch classification consistency", addr);
+    tracing::info!("  GET  http://{}/api/compliance/prohibited/:hs_code - Check cross-border e-commerce prohibited items", addr);
+    tracing::info!("  GET  http://{}/api/compliance/ccc-cert/:hs_code - Check CCC certification requirement", addr);
+    tracing::info!("  GET  http://{}/api/compliance/check/:hs_code - Comprehensive compliance check (prohibited + CCC)", addr);
 
     Server::bind(&addr)
         .serve(app.into_make_service())

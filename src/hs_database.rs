@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+pub mod compliance_data;
 pub mod hs_data;
 
+pub use compliance_data::{get_ccc_cert_items, get_prohibited_items};
 pub use hs_data::get_database;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +79,50 @@ pub struct BatchConsistencyResult {
     pub conflicting_categories: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProhibitedItem {
+    pub hs_code_prefix: String,
+    pub name: String,
+    pub reason: String,
+    pub regulation: String,
+    pub severity: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CccCertItem {
+    pub hs_code_prefix: String,
+    pub product_name: String,
+    pub ccc_category: String,
+    pub cert_required: bool,
+    pub standard: String,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProhibitedCheckResult {
+    pub hs_code: String,
+    pub is_prohibited: bool,
+    pub matched_items: Vec<ProhibitedItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CccCheckResult {
+    pub hs_code: String,
+    pub ccc_cert_required: bool,
+    pub matched_items: Vec<CccCertItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ComplianceCheckResult {
+    pub hs_code: String,
+    pub normalized_hs_code: String,
+    pub is_prohibited: bool,
+    pub ccc_cert_required: bool,
+    pub prohibited_items: Vec<ProhibitedItem>,
+    pub ccc_items: Vec<CccCertItem>,
+    pub compliance_risks: Vec<TaxRisk>,
+}
+
 pub struct HsDatabase;
 
 impl HsDatabase {
@@ -96,7 +142,10 @@ impl HsDatabase {
         }
 
         let (primary, alternatives) = Self::select_best_matches(all_matches, &cleaned);
-        let risks = Self::assess_risks(&primary, &alternatives, &cleaned);
+        let mut risks = Self::assess_risks(&primary, &alternatives, &cleaned);
+        let mut compliance_risks = Self::check_compliance_risks(&cleaned);
+        risks.append(&mut compliance_risks);
+
         let is_ambiguous = alternatives.iter().any(|a| {
             (a.match_score - primary.match_score).abs() < 0.05
         });
@@ -292,6 +341,55 @@ impl HsDatabase {
 
     pub fn list_categories() -> Vec<HsCategory> {
         get_database()
+    }
+
+    pub fn check_prohibited(hs_code: &str) -> ProhibitedCheckResult {
+        let cleaned = Self::normalize_hs_code(hs_code);
+        let prohibited = get_prohibited_items();
+        let matched: Vec<ProhibitedItem> = prohibited
+            .into_iter()
+            .filter(|p| cleaned.starts_with(&p.hs_code_prefix))
+            .collect();
+
+        ProhibitedCheckResult {
+            hs_code: cleaned,
+            is_prohibited: !matched.is_empty(),
+            matched_items: matched,
+        }
+    }
+
+    pub fn check_ccc_cert(hs_code: &str) -> CccCheckResult {
+        let cleaned = Self::normalize_hs_code(hs_code);
+        let ccc_items = get_ccc_cert_items();
+        let matched: Vec<CccCertItem> = ccc_items
+            .into_iter()
+            .filter(|c| cleaned.starts_with(&c.hs_code_prefix))
+            .collect();
+
+        let cert_required = matched.iter().any(|m| m.cert_required);
+
+        CccCheckResult {
+            hs_code: cleaned,
+            ccc_cert_required: cert_required,
+            matched_items: matched,
+        }
+    }
+
+    pub fn check_compliance(hs_code: &str) -> ComplianceCheckResult {
+        let cleaned = Self::normalize_hs_code(hs_code);
+        let prohibited_result = Self::check_prohibited(hs_code);
+        let ccc_result = Self::check_ccc_cert(hs_code);
+        let compliance_risks = Self::check_compliance_risks(&cleaned);
+
+        ComplianceCheckResult {
+            hs_code: hs_code.to_string(),
+            normalized_hs_code: cleaned,
+            is_prohibited: prohibited_result.is_prohibited,
+            ccc_cert_required: ccc_result.ccc_cert_required,
+            prohibited_items: prohibited_result.matched_items,
+            ccc_items: ccc_result.matched_items,
+            compliance_risks,
+        }
     }
 
     fn normalize_hs_code(hs_code: &str) -> String {
@@ -556,6 +654,129 @@ impl HsDatabase {
             };
             order_a.cmp(&order_b)
         });
+
+        risks
+    }
+
+    fn check_compliance_risks(cleaned: &str) -> Vec<TaxRisk> {
+        let mut risks: Vec<TaxRisk> = Vec::new();
+
+        let prohibited = get_prohibited_items();
+        let matched_prohibited: Vec<&ProhibitedItem> = prohibited
+            .iter()
+            .filter(|p| cleaned.starts_with(&p.hs_code_prefix))
+            .collect();
+
+        if !matched_prohibited.is_empty() {
+            let critical_items: Vec<&&ProhibitedItem> = matched_prohibited
+                .iter()
+                .filter(|p| p.severity == "Critical")
+                .collect();
+
+            let names: Vec<String> = matched_prohibited
+                .iter()
+                .map(|p| p.name.clone())
+                .collect();
+
+            let risk_level = if !critical_items.is_empty() {
+                RiskLevel::Critical
+            } else {
+                RiskLevel::High
+            };
+
+            let regulations: Vec<String> = matched_prohibited
+                .iter()
+                .map(|p| p.regulation.clone())
+                .collect();
+
+            risks.push(TaxRisk {
+                risk_level,
+                risk_type: "PROHIBITED_IMPORT".to_string(),
+                risk_code: "R009".to_string(),
+                description: format!(
+                    "HS code {} matches prohibited/restricted cross-border e-commerce import category: {}. Import of these goods is not permitted under current regulations",
+                    cleaned,
+                    names.join(", ")
+                ),
+                suggestion: format!(
+                    "DO NOT proceed with import. This product category is prohibited or restricted for cross-border e-commerce. Refer to: {}. Consult customs broker for alternative import channels if applicable",
+                    regulations.join("; ")
+                ),
+                tax_difference_potential: None,
+            });
+        }
+
+        let ccc_items = get_ccc_cert_items();
+        let matched_ccc: Vec<&CccCertItem> = ccc_items
+            .iter()
+            .filter(|c| cleaned.starts_with(&c.hs_code_prefix))
+            .collect();
+
+        let cert_required_items: Vec<&&CccCertItem> = matched_ccc
+            .iter()
+            .filter(|c| c.cert_required)
+            .collect();
+
+        let cert_not_required_items: Vec<&&CccCertItem> = matched_ccc
+            .iter()
+            .filter(|c| !c.cert_required)
+            .collect();
+
+        if !cert_required_items.is_empty() {
+            let names: Vec<String> = cert_required_items
+                .iter()
+                .map(|c| c.product_name.clone())
+                .collect();
+
+            let standards: Vec<String> = cert_required_items
+                .iter()
+                .map(|c| c.standard.clone())
+                .collect();
+
+            risks.push(TaxRisk {
+                risk_level: RiskLevel::High,
+                risk_type: "CCC_CERTIFICATION_REQUIRED".to_string(),
+                risk_code: "R010".to_string(),
+                description: format!(
+                    "HS code {} requires mandatory CCC (China Compulsory Certification) for: {}. Products without valid CCC certificate cannot be legally imported and sold in China",
+                    cleaned,
+                    names.join(", ")
+                ),
+                suggestion: format!(
+                    "Ensure product has valid CCC certification before import. Applicable standards: {}. Importing CCC-required products without certification will result in seizure, fines and potential criminal liability",
+                    standards.join("; ")
+                ),
+                tax_difference_potential: None,
+            });
+        }
+
+        if !cert_not_required_items.is_empty() {
+            let names: Vec<String> = cert_not_required_items
+                .iter()
+                .map(|c| c.product_name.clone())
+                .collect();
+
+            let standards: Vec<String> = cert_not_required_items
+                .iter()
+                .map(|c| c.standard.clone())
+                .collect();
+
+            risks.push(TaxRisk {
+                risk_level: RiskLevel::Low,
+                risk_type: "QUALITY_STANDARD_ADVISORY".to_string(),
+                risk_code: "R011".to_string(),
+                description: format!(
+                    "HS code {} matches product category that does not require CCC certification but should comply with quality standards: {}",
+                    cleaned,
+                    names.join(", ")
+                ),
+                suggestion: format!(
+                    "Although CCC certification is not mandatory, products must comply with applicable national standards: {}. Non-compliance may result in quality inspection failures and consumer complaints",
+                    standards.join("; ")
+                ),
+                tax_difference_potential: None,
+            });
+        }
 
         risks
     }

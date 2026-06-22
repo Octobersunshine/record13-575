@@ -35,6 +35,8 @@ pub struct TaxCalculateResponse {
     pub normalized_hs_code: String,
     pub alternatives: Vec<MatchCandidate>,
     pub risks: Vec<TaxRisk>,
+    pub is_prohibited: bool,
+    pub ccc_cert_required: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -58,6 +60,9 @@ impl TaxCalculator {
             .ok_or_else(|| format!("Unrecognized HS code: {}", req.hs_code))?;
 
         let category = &classification.primary.category;
+
+        let prohibited_check = crate::hs_database::HsDatabase::check_prohibited(&req.hs_code);
+        let ccc_check = crate::hs_database::HsDatabase::check_ccc_cert(&req.hs_code);
 
         let insurance = req.insurance.unwrap_or_else(|| {
             (req.transaction_price + req.freight) * 0.003
@@ -116,6 +121,8 @@ impl TaxCalculator {
             normalized_hs_code: classification.normalized_hs_code.clone(),
             alternatives: classification.alternatives,
             risks: classification.risks,
+            is_prohibited: prohibited_check.is_prohibited,
+            ccc_cert_required: ccc_check.ccc_cert_required,
         })
     }
 
