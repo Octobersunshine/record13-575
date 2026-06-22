@@ -5,14 +5,20 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
+use crate::hs_database::{BatchItem, BatchConsistencyResult};
 use crate::tax_calculator::{ErrorResponse, TaxCalculateRequest, TaxCalculator};
 
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     status: String,
     message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchConsistencyRequest {
+    items: Vec<BatchItem>,
 }
 
 async fn health_check() -> impl IntoResponse {
@@ -37,8 +43,8 @@ async fn calculate_tax(Json(payload): Json<TaxCalculateRequest>) -> impl IntoRes
 }
 
 async fn lookup_category(Path(hs_code): Path<String>) -> impl IntoResponse {
-    match crate::hs_database::HsDatabase::lookup(&hs_code) {
-        Some(category) => (StatusCode::OK, Json(serde_json::to_value(category).unwrap())).into_response(),
+    match crate::hs_database::HsDatabase::classify(&hs_code) {
+        Some(result) => (StatusCode::OK, Json(serde_json::to_value(result).unwrap())).into_response(),
         None => {
             let error = ErrorResponse {
                 error: "Not found".to_string(),
@@ -54,10 +60,16 @@ async fn list_all_categories() -> impl IntoResponse {
     (StatusCode::OK, Json(serde_json::to_value(categories).unwrap()))
 }
 
+async fn check_batch_consistency(Json(payload): Json<BatchConsistencyRequest>) -> impl IntoResponse {
+    let result: BatchConsistencyResult = crate::hs_database::HsDatabase::check_batch_consistency(&payload.items);
+    (StatusCode::OK, Json(serde_json::to_value(result).unwrap())).into_response()
+}
+
 pub fn create_router() -> Router {
     Router::new()
         .route("/health", get(health_check))
         .route("/api/tax/calculate", post(calculate_tax))
         .route("/api/category/lookup/:hs_code", get(lookup_category))
         .route("/api/categories", get(list_all_categories))
+        .route("/api/batch/consistency-check", post(check_batch_consistency))
 }

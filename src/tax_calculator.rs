@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::hs_database::HsCategory;
+use crate::hs_database::{ClassificationResult, HsCategory, MatchCandidate, TaxRisk};
 
 #[derive(Debug, Deserialize)]
 pub struct TaxCalculateRequest {
@@ -29,6 +29,12 @@ pub struct TaxCalculateResponse {
     pub comprehensive_tax_amount: f64,
     pub comprehensive_tax_rate: f64,
     pub total_price_after_tax: f64,
+    pub match_level: String,
+    pub match_score: f64,
+    pub is_ambiguous: bool,
+    pub normalized_hs_code: String,
+    pub alternatives: Vec<MatchCandidate>,
+    pub risks: Vec<TaxRisk>,
 }
 
 #[derive(Debug, Serialize)]
@@ -48,8 +54,10 @@ impl TaxCalculator {
             return Err("Freight cannot be negative".to_string());
         }
 
-        let category = crate::hs_database::HsDatabase::lookup(&req.hs_code)
+        let classification: ClassificationResult = crate::hs_database::HsDatabase::classify(&req.hs_code)
             .ok_or_else(|| format!("Unrecognized HS code: {}", req.hs_code))?;
+
+        let category = &classification.primary.category;
 
         let insurance = req.insurance.unwrap_or_else(|| {
             (req.transaction_price + req.freight) * 0.003
@@ -102,11 +110,17 @@ impl TaxCalculator {
             comprehensive_tax_amount,
             comprehensive_tax_rate,
             total_price_after_tax,
+            match_level: classification.primary.match_level.clone(),
+            match_score: classification.primary.match_score,
+            is_ambiguous: classification.is_ambiguous,
+            normalized_hs_code: classification.normalized_hs_code.clone(),
+            alternatives: classification.alternatives,
+            risks: classification.risks,
         })
     }
 
     pub fn list_categories() -> Vec<HsCategory> {
-        crate::hs_database::HsDatabase::database()
+        crate::hs_database::HsDatabase::list_categories()
     }
 
     fn round(value: f64) -> f64 {

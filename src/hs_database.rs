@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+pub mod hs_data;
+
+pub use hs_data::get_database;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HsCategory {
     pub hs_code: String,
@@ -11,1048 +15,548 @@ pub struct HsCategory {
     pub consumption_tax_rate: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MatchCandidate {
+    pub category: HsCategory,
+    pub match_score: f64,
+    pub match_level: String,
+    pub matched_prefix: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum RiskLevel {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaxRisk {
+    pub risk_level: RiskLevel,
+    pub risk_type: String,
+    pub risk_code: String,
+    pub description: String,
+    pub suggestion: String,
+    pub tax_difference_potential: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClassificationResult {
+    pub primary: MatchCandidate,
+    pub alternatives: Vec<MatchCandidate>,
+    pub risks: Vec<TaxRisk>,
+    pub is_ambiguous: bool,
+    pub input_hs_code: String,
+    pub normalized_hs_code: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BatchItem {
+    pub hs_code: String,
+    pub item_name: Option<String>,
+    pub transaction_price: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchConsistencyIssue {
+    pub severity: RiskLevel,
+    pub issue_type: String,
+    pub description: String,
+    pub affected_items: Vec<String>,
+    pub suggestion: String,
+    pub estimated_tax_variance: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchConsistencyResult {
+    pub is_consistent: bool,
+    pub issues: Vec<BatchConsistencyIssue>,
+    pub total_items: usize,
+    pub unique_hs_codes: usize,
+    pub conflicting_categories: Vec<String>,
+}
+
 pub struct HsDatabase;
 
 impl HsDatabase {
     pub fn lookup(hs_code: &str) -> Option<HsCategory> {
-        let cleaned = hs_code.replace('.', "").replace(' ', "");
-        let prefixes: Vec<&str> = (1..=cleaned.len())
-            .rev()
-            .map(|i| &cleaned[..i])
+        Self::classify(hs_code).map(|r| r.primary.category)
+    }
+
+    pub fn classify(hs_code: &str) -> Option<ClassificationResult> {
+        let cleaned = Self::normalize_hs_code(hs_code);
+        if cleaned.is_empty() {
+            return None;
+        }
+
+        let all_matches = Self::find_all_matches(&cleaned);
+        if all_matches.is_empty() {
+            return None;
+        }
+
+        let (primary, alternatives) = Self::select_best_matches(all_matches, &cleaned);
+        let risks = Self::assess_risks(&primary, &alternatives, &cleaned);
+        let is_ambiguous = alternatives.iter().any(|a| {
+            (a.match_score - primary.match_score).abs() < 0.05
+        });
+
+        Some(ClassificationResult {
+            primary,
+            alternatives,
+            risks,
+            is_ambiguous,
+            input_hs_code: hs_code.to_string(),
+            normalized_hs_code: cleaned,
+        })
+    }
+
+    pub fn check_batch_consistency(batch: &[BatchItem]) -> BatchConsistencyResult {
+        let mut issues: Vec<BatchConsistencyIssue> = Vec::new();
+        let mut conflicting_categories: Vec<String> = Vec::new();
+
+        let unique_hs: std::collections::HashSet<String> = batch
+            .iter()
+            .map(|item| Self::normalize_hs_code(&item.hs_code))
             .collect();
 
-        for prefix in prefixes {
-            if let Some(cat) = Self::find_by_prefix(prefix) {
-                return Some(cat);
+        let mut category_groups: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        let mut hs_to_rates: std::collections::HashMap<String, (f64, f64, f64)> =
+            std::collections::HashMap::new();
+
+        for item in batch {
+            let normalized = Self::normalize_hs_code(&item.hs_code);
+            if let Some(result) = Self::classify(&item.hs_code) {
+                let cat_key = result.primary.category.category.clone();
+                let item_id = item
+                    .item_name
+                    .clone()
+                    .unwrap_or_else(|| format!("HS: {}", normalized));
+
+                category_groups
+                    .entry(cat_key.clone())
+                    .or_default()
+                    .push(item_id.clone());
+
+                hs_to_rates.insert(
+                    normalized.clone(),
+                    (
+                        result.primary.category.tariff_rate,
+                        result.primary.category.vat_rate,
+                        result.primary.category.consumption_tax_rate,
+                    ),
+                );
+
+                if result.is_ambiguous {
+                    let sample_price = item.transaction_price.unwrap_or(1000.0);
+                    let mut variance = 0.0;
+                    for alt in &result.alternatives {
+                        if (alt.match_score - result.primary.match_score).abs() < 0.1 {
+                            let primary_tax = sample_price
+                                * (result.primary.category.tariff_rate
+                                    + result.primary.category.vat_rate
+                                    + result.primary.category.consumption_tax_rate);
+                            let alt_tax = sample_price
+                                * (alt.category.tariff_rate
+                                    + alt.category.vat_rate
+                                    + alt.category.consumption_tax_rate);
+                            variance = variance.max((primary_tax - alt_tax).abs());
+                        }
+                    }
+
+                    issues.push(BatchConsistencyIssue {
+                        severity: if variance > sample_price * 0.05 {
+                            RiskLevel::High
+                        } else if variance > sample_price * 0.02 {
+                            RiskLevel::Medium
+                        } else {
+                            RiskLevel::Low
+                        },
+                        issue_type: "AMBIGUOUS_CLASSIFICATION".to_string(),
+                        description: format!(
+                            "Item has ambiguous HS classification with multiple valid candidates",
+                        ),
+                        affected_items: vec![item
+                            .item_name
+                            .clone()
+                            .unwrap_or_else(|| format!("HS: {}", normalized))],
+                        suggestion: format!(
+                            "Review HS code {} classification carefully, verify against product specifications and customs rulings",
+                            normalized
+                        ),
+                        estimated_tax_variance: if variance > 0.0 { Some(variance) } else { None },
+                    });
+                }
             }
         }
-        None
+
+        let rates: Vec<&(f64, f64, f64)> = hs_to_rates.values().collect();
+        if rates.len() >= 2 {
+            let mut max_tariff = 0.0;
+            let mut min_tariff = f64::MAX;
+            let mut max_consumption = 0.0;
+            for (t, _, c) in &rates {
+                max_tariff = max_tariff.max(*t);
+                min_tariff = min_tariff.min(*t);
+                max_consumption = max_consumption.max(*c);
+            }
+            if (max_tariff - min_tariff) > 0.10 {
+                conflicting_categories.push("Significant tariff rate variance in batch".to_string());
+                issues.push(BatchConsistencyIssue {
+                    severity: RiskLevel::High,
+                    issue_type: "RATE_VARIANCE".to_string(),
+                    description: format!(
+                        "Tariff rates vary significantly across batch from {:.1}% to {:.1}%",
+                        min_tariff * 100.0, max_tariff * 100.0
+                    ),
+                    affected_items: batch
+                        .iter()
+                        .map(|i| {
+                            i.item_name
+                                .clone()
+                                .unwrap_or_else(|| format!("HS: {}", Self::normalize_hs_code(&i.hs_code)))
+                        })
+                        .collect(),
+                    suggestion: "Verify that all items are correctly categorized; rate variance may indicate misclassification or mixed product types".to_string(),
+                    estimated_tax_variance: None,
+                });
+            }
+            if max_consumption > 0.0 {
+                let has_non_taxed = rates.iter().any(|(_, _, c)| *c == 0.0);
+                if has_non_taxed {
+                    conflicting_categories.push("Mixed consumption tax treatment".to_string());
+                    issues.push(BatchConsistencyIssue {
+                        severity: RiskLevel::Medium,
+                        issue_type: "MIXED_CONSUMPTION_TAX".to_string(),
+                        description:
+                            "Some items are subject to consumption tax while others are not in the same batch"
+                                .to_string(),
+                        affected_items: batch
+                            .iter()
+                            .map(|i| {
+                                i.item_name
+                                    .clone()
+                                    .unwrap_or_else(|| format!("HS: {}", Self::normalize_hs_code(&i.hs_code)))
+                            })
+                            .collect(),
+                        suggestion: "Verify products are not misclassified; consumption tax differences may indicate mixed product categories".to_string(),
+                        estimated_tax_variance: None,
+                    });
+                }
+            }
+        }
+
+        if category_groups.len() > 1 {
+            let large_groups: Vec<&String> = category_groups
+                .iter()
+                .filter(|(_, v)| v.len() > 1)
+                .map(|(k, _)| k)
+                .collect();
+            if large_groups.len() > 1 {
+                conflicting_categories.extend(large_groups.into_iter().cloned());
+                issues.push(BatchConsistencyIssue {
+                    severity: RiskLevel::Medium,
+                    issue_type: "MIXED_CATEGORIES".to_string(),
+                    description: format!(
+                        "Batch contains items across {} different major categories",
+                        category_groups.len()
+                    ),
+                    affected_items: batch
+                        .iter()
+                        .map(|i| {
+                            i.item_name
+                                .clone()
+                                .unwrap_or_else(|| format!("HS: {}", Self::normalize_hs_code(&i.hs_code)))
+                        })
+                        .collect(),
+                    suggestion: "Ensure batch contains related products; mixed categories may cause customs scrutiny".to_string(),
+                    estimated_tax_variance: None,
+                });
+            }
+        }
+
+        let is_consistent = issues.is_empty()
+            || issues
+                .iter()
+                .all(|i| i.severity == RiskLevel::Low);
+
+        BatchConsistencyResult {
+            is_consistent,
+            issues,
+            total_items: batch.len(),
+            unique_hs_codes: unique_hs.len(),
+            conflicting_categories,
+        }
     }
 
-    fn find_by_prefix(prefix: &str) -> Option<HsCategory> {
-        let db = Self::database();
-        db.into_iter().find(|c| c.hs_code.starts_with(prefix) || prefix.starts_with(&c.hs_code))
+    pub fn list_categories() -> Vec<HsCategory> {
+        get_database()
     }
 
-    fn database() -> Vec<HsCategory> {
-        vec![
-            HsCategory {
-                hs_code: "01".to_string(),
-                category: "Live Animals".to_string(),
-                subcategory: "Live Animals".to_string(),
-                description: "Horses, cattle, sheep, pigs, poultry and other live animals".to_string(),
-                tariff_rate: 0.10,
-                vat_rate: 0.09,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "02".to_string(),
-                category: "Meat and Edible Meat Offal".to_string(),
-                subcategory: "Meat Products".to_string(),
-                description: "Fresh, chilled, frozen meat and edible offal".to_string(),
-                tariff_rate: 0.12,
-                vat_rate: 0.09,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "03".to_string(),
-                category: "Fish, Crustaceans, Molluscs".to_string(),
-                subcategory: "Aquatic Products".to_string(),
-                description: "Fish, crustaceans, molluscs and other aquatic invertebrates".to_string(),
-                tariff_rate: 0.10,
-                vat_rate: 0.09,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "04".to_string(),
-                category: "Dairy Produce, Eggs, Honey".to_string(),
-                subcategory: "Animal Products".to_string(),
-                description: "Milk, eggs, honey and other edible animal products".to_string(),
-                tariff_rate: 0.15,
-                vat_rate: 0.09,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "06".to_string(),
-                category: "Live Trees and Other Live Plants".to_string(),
-                subcategory: "Plant Products".to_string(),
-                description: "Live plants, bulbs, roots and cut flowers".to_string(),
-                tariff_rate: 0.10,
-                vat_rate: 0.09,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "07".to_string(),
-                category: "Edible Vegetables, Roots and Tubers".to_string(),
-                subcategory: "Vegetables".to_string(),
-                description: "Fresh, chilled, frozen vegetables and roots".to_string(),
-                tariff_rate: 0.13,
-                vat_rate: 0.09,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "08".to_string(),
-                category: "Edible Fruit and Nuts".to_string(),
-                subcategory: "Fruit and Nuts".to_string(),
-                description: "Fresh or dried fruit and nuts".to_string(),
-                tariff_rate: 0.15,
-                vat_rate: 0.09,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "09".to_string(),
-                category: "Coffee, Tea, Mate and Spices".to_string(),
-                subcategory: "Beverages and Spices".to_string(),
-                description: "Coffee, tea and spices".to_string(),
-                tariff_rate: 0.15,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "10".to_string(),
-                category: "Cereals".to_string(),
-                subcategory: "Grains".to_string(),
-                description: "Wheat, corn, rice and other cereals".to_string(),
-                tariff_rate: 0.01,
-                vat_rate: 0.09,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "12".to_string(),
-                category: "Oil Seeds, Industrial or Medicinal Plants".to_string(),
-                subcategory: "Oilseed Crops".to_string(),
-                description: "Oil seeds and fruits, seeds for planting".to_string(),
-                tariff_rate: 0.09,
-                vat_rate: 0.09,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "15".to_string(),
-                category: "Animal or Vegetable Fats and Oils".to_string(),
-                subcategory: "Fats and Oils".to_string(),
-                description: "Animal and vegetable fats and oils and waxes".to_string(),
-                tariff_rate: 0.10,
-                vat_rate: 0.09,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "16".to_string(),
-                category: "Meat, Fish and Aquatic Invertebrate Products".to_string(),
-                subcategory: "Meat and Seafood Products".to_string(),
-                description: "Products of meat, fish or aquatic invertebrates".to_string(),
-                tariff_rate: 0.15,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "17".to_string(),
-                category: "Sugars and Sugar Confectionery".to_string(),
-                subcategory: "Sugar Products".to_string(),
-                description: "Sugar, sugar confectionery and cocoa products".to_string(),
-                tariff_rate: 0.20,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "18".to_string(),
-                category: "Cocoa and Cocoa Preparations".to_string(),
-                subcategory: "Cocoa Products".to_string(),
-                description: "Cocoa, chocolate and their preparations".to_string(),
-                tariff_rate: 0.15,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "19".to_string(),
-                category: "Preparations of Cereals, Flour, Milk and Pastry".to_string(),
-                subcategory: "Flour Products".to_string(),
-                description: "Cereal preparations, bread and pastry".to_string(),
-                tariff_rate: 0.20,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "20".to_string(),
-                category: "Preparations of Vegetables, Fruit and Nuts".to_string(),
-                subcategory: "Fruit and Vegetable Products".to_string(),
-                description: "Preparations of vegetables, fruit and nuts".to_string(),
-                tariff_rate: 0.15,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "21".to_string(),
-                category: "Miscellaneous Edible Preparations".to_string(),
-                subcategory: "Condiments".to_string(),
-                description: "Condiments, soups, ice cream".to_string(),
-                tariff_rate: 0.21,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "22".to_string(),
-                category: "Beverages, Spirits and Vinegar".to_string(),
-                subcategory: "Alcoholic Beverages".to_string(),
-                description: "Alcoholic beverages, non-alcoholic beverages, vinegar".to_string(),
-                tariff_rate: 0.20,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.10,
-            },
-            HsCategory {
-                hs_code: "2203".to_string(),
-                category: "Beverages, Spirits and Vinegar".to_string(),
-                subcategory: "Beer".to_string(),
-                description: "Beer made from malt".to_string(),
-                tariff_rate: 0.00,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.25,
-            },
-            HsCategory {
-                hs_code: "2204".to_string(),
-                category: "Beverages, Spirits and Vinegar".to_string(),
-                subcategory: "Wine".to_string(),
-                description: "Wine from fresh grapes".to_string(),
-                tariff_rate: 0.14,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.10,
-            },
-            HsCategory {
-                hs_code: "2208".to_string(),
-                category: "Beverages, Spirits and Vinegar".to_string(),
-                subcategory: "Distilled Spirits".to_string(),
-                description: "Distilled spirits, liqueurs and other spirituous beverages".to_string(),
-                tariff_rate: 0.10,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.20,
-            },
-            HsCategory {
-                hs_code: "23".to_string(),
-                category: "Residues and Waste from Food Industries".to_string(),
-                subcategory: "Animal Feed".to_string(),
-                description: "Food industry residues, prepared animal feed".to_string(),
-                tariff_rate: 0.05,
-                vat_rate: 0.09,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "24".to_string(),
-                category: "Tobacco and Manufactured Tobacco Substitutes".to_string(),
-                subcategory: "Tobacco Products".to_string(),
-                description: "Tobacco and tobacco products".to_string(),
-                tariff_rate: 0.25,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.36,
-            },
-            HsCategory {
-                hs_code: "25".to_string(),
-                category: "Salt, Sulphur, Earths and Stone".to_string(),
-                subcategory: "Mineral Products".to_string(),
-                description: "Salt, sulphur, earths, stones, ores".to_string(),
-                tariff_rate: 0.03,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "27".to_string(),
-                category: "Mineral Fuels, Mineral Oils and their Distillation Products".to_string(),
-                subcategory: "Energy Products".to_string(),
-                description: "Petroleum, coal, natural gas and their products".to_string(),
-                tariff_rate: 0.05,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "2710".to_string(),
-                category: "Mineral Fuels and Oils".to_string(),
-                subcategory: "Refined Petroleum".to_string(),
-                description: "Refined petroleum products (gasoline, diesel, lubricants)".to_string(),
-                tariff_rate: 0.05,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.20,
-            },
-            HsCategory {
-                hs_code: "28".to_string(),
-                category: "Inorganic Chemicals".to_string(),
-                subcategory: "Chemicals".to_string(),
-                description: "Inorganic chemicals, precious metals, rare earths".to_string(),
-                tariff_rate: 0.05,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "29".to_string(),
-                category: "Organic Chemicals".to_string(),
-                subcategory: "Chemicals".to_string(),
-                description: "Organic chemicals".to_string(),
-                tariff_rate: 0.06,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "30".to_string(),
-                category: "Pharmaceutical Products".to_string(),
-                subcategory: "Medicine".to_string(),
-                description: "Medicaments for human or veterinary use".to_string(),
-                tariff_rate: 0.04,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "31".to_string(),
-                category: "Fertilizers".to_string(),
-                subcategory: "Agricultural Products".to_string(),
-                description: "Chemical fertilizers".to_string(),
-                tariff_rate: 0.04,
-                vat_rate: 0.09,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "32".to_string(),
-                category: "Tanning, Dyes, Pigments, Paints and Inks".to_string(),
-                subcategory: "Chemicals".to_string(),
-                description: "Dyes, pigments, paints, inks".to_string(),
-                tariff_rate: 0.10,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.04,
-            },
-            HsCategory {
-                hs_code: "33".to_string(),
-                category: "Essential Oils, Perfumery, Cosmetics and Toilet Preparations".to_string(),
-                subcategory: "Cosmetics".to_string(),
-                description: "Essential oils, cosmetics, skincare products".to_string(),
-                tariff_rate: 0.05,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.15,
-            },
-            HsCategory {
-                hs_code: "34".to_string(),
-                category: "Soaps, Organic Surface-active Agents and Washing Preparations".to_string(),
-                subcategory: "Daily Chemicals".to_string(),
-                description: "Soap, detergents, lubricants".to_string(),
-                tariff_rate: 0.10,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "35".to_string(),
-                category: "Albuminoidal Substances, Modified Starches, Gums and Enzymes".to_string(),
-                subcategory: "Chemicals".to_string(),
-                description: "Proteins, enzymes, modified starches".to_string(),
-                tariff_rate: 0.10,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "36".to_string(),
-                category: "Explosives, Pyrotechnic Products and Matches".to_string(),
-                subcategory: "Hazardous Chemicals".to_string(),
-                description: "Explosives, pyrotechnic products, flammable goods".to_string(),
-                tariff_rate: 0.09,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "37".to_string(),
-                category: "Photographic or Cinematographic Goods".to_string(),
-                subcategory: "Photographic Goods".to_string(),
-                description: "Photographic chemical preparations, film".to_string(),
-                tariff_rate: 0.08,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "38".to_string(),
-                category: "Miscellaneous Chemical Products".to_string(),
-                subcategory: "Chemicals".to_string(),
-                description: "Other chemical products".to_string(),
-                tariff_rate: 0.06,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "39".to_string(),
-                category: "Plastics and Articles Thereof".to_string(),
-                subcategory: "Plastic Products".to_string(),
-                description: "Plastic materials and plastic products".to_string(),
-                tariff_rate: 0.06,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "40".to_string(),
-                category: "Rubber and Articles Thereof".to_string(),
-                subcategory: "Rubber Products".to_string(),
-                description: "Natural rubber, synthetic rubber and their products".to_string(),
-                tariff_rate: 0.08,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "41".to_string(),
-                category: "Raw Hides and Skins (other than furskins) and Leather".to_string(),
-                subcategory: "Leather".to_string(),
-                description: "Raw hides and leather".to_string(),
-                tariff_rate: 0.08,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "42".to_string(),
-                category: "Articles of Leather, Travel Goods and Handbags".to_string(),
-                subcategory: "Leather Goods".to_string(),
-                description: "Leather articles, luggage, saddlery".to_string(),
-                tariff_rate: 0.10,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "43".to_string(),
-                category: "Furskins and Artificial Fur and Manufactures Thereof".to_string(),
-                subcategory: "Fur Products".to_string(),
-                description: "Furskins and artificial fur and their products".to_string(),
-                tariff_rate: 0.15,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "44".to_string(),
-                category: "Wood and Articles of Wood".to_string(),
-                subcategory: "Timber".to_string(),
-                description: "Wood, cork and wood products".to_string(),
-                tariff_rate: 0.00,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "4407".to_string(),
-                category: "Wood and Wood Products".to_string(),
-                subcategory: "Lumber".to_string(),
-                description: "Wood sawn or chipped lengthwise".to_string(),
-                tariff_rate: 0.00,
-                vat_rate: 0.09,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "45".to_string(),
-                category: "Cork and Articles of Cork".to_string(),
-                subcategory: "Cork Products".to_string(),
-                description: "Cork and cork products".to_string(),
-                tariff_rate: 0.06,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "46".to_string(),
-                category: "Articles of Straw, Esparto and Other Plaiting Materials".to_string(),
-                subcategory: "Woven Products".to_string(),
-                description: "Wickerwork, baskets and wickerwork articles".to_string(),
-                tariff_rate: 0.10,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "47".to_string(),
-                category: "Pulp of Wood or of Other Fibrous Cellulosic Material".to_string(),
-                subcategory: "Paper Pulp".to_string(),
-                description: "Paper pulp, waste and scrap of paper or paperboard".to_string(),
-                tariff_rate: 0.00,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "48".to_string(),
-                category: "Paper and Paperboard, Articles of Paper Pulp".to_string(),
-                subcategory: "Paper Products".to_string(),
-                description: "Paper and paperboard, paper products".to_string(),
-                tariff_rate: 0.05,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "49".to_string(),
-                category: "Printed Books, Newspapers and Other Printed Matter".to_string(),
-                subcategory: "Printed Materials".to_string(),
-                description: "Books, newspapers, printed matter".to_string(),
-                tariff_rate: 0.00,
-                vat_rate: 0.09,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "50".to_string(),
-                category: "Silk".to_string(),
-                subcategory: "Textile Materials".to_string(),
-                description: "Silk and silk waste".to_string(),
-                tariff_rate: 0.06,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "51".to_string(),
-                category: "Wool, Fine or Coarse Animal Hair, Horsehair Yarn and Woven Fabric".to_string(),
-                subcategory: "Textile Materials".to_string(),
-                description: "Wool and animal hair".to_string(),
-                tariff_rate: 0.06,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "52".to_string(),
-                category: "Cotton".to_string(),
-                subcategory: "Textile Materials".to_string(),
-                description: "Cotton (including raw, waste, combed cotton)".to_string(),
-                tariff_rate: 0.04,
-                vat_rate: 0.09,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "53".to_string(),
-                category: "Other Vegetable Textile Fibres".to_string(),
-                subcategory: "Textile Materials".to_string(),
-                description: "Other vegetable textile fibres, paper yarn and woven fabrics".to_string(),
-                tariff_rate: 0.06,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "54".to_string(),
-                category: "Man-made Filaments".to_string(),
-                subcategory: "Textile Materials".to_string(),
-                description: "Man-made filaments".to_string(),
-                tariff_rate: 0.05,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "55".to_string(),
-                category: "Man-made Staple Fibres".to_string(),
-                subcategory: "Textile Materials".to_string(),
-                description: "Man-made staple fibres".to_string(),
-                tariff_rate: 0.05,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "56".to_string(),
-                category: "Wadding, Felt and Nonwovens, Special Yarns, Twine and Cords".to_string(),
-                subcategory: "Textile Products".to_string(),
-                description: "Nonwovens, special yarns, ropes and cords".to_string(),
-                tariff_rate: 0.10,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "57".to_string(),
-                category: "Carpets and Other Textile Floor Coverings".to_string(),
-                subcategory: "Textile Products".to_string(),
-                description: "Carpets and floor coverings".to_string(),
-                tariff_rate: 0.14,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "58".to_string(),
-                category: "Special Woven Fabrics, Tufted Textile Fabrics, Lace and Tapestries".to_string(),
-                subcategory: "Textile Products".to_string(),
-                description: "Special fabrics, lace, tapestries".to_string(),
-                tariff_rate: 0.12,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "59".to_string(),
-                category: "Impregnated, Coated, Covered or Laminated Textile Fabrics".to_string(),
-                subcategory: "Textile Products".to_string(),
-                description: "Impregnated or coated textile fabrics".to_string(),
-                tariff_rate: 0.10,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "60".to_string(),
-                category: "Knitted or Crocheted Fabrics".to_string(),
-                subcategory: "Textile Products".to_string(),
-                description: "Knitted or crocheted fabrics".to_string(),
-                tariff_rate: 0.10,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "61".to_string(),
-                category: "Articles of Apparel and Clothing Accessories, Knitted or Crocheted".to_string(),
-                subcategory: "Garments".to_string(),
-                description: "Knitted or crocheted garments and clothing accessories".to_string(),
-                tariff_rate: 0.16,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "62".to_string(),
-                category: "Articles of Apparel and Clothing Accessories, Not Knitted or Crocheted".to_string(),
-                subcategory: "Garments".to_string(),
-                description: "Non-knitted or non-crocheted garments".to_string(),
-                tariff_rate: 0.16,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "63".to_string(),
-                category: "Other Made-up Textile Articles, Sets, Worn Clothing".to_string(),
-                subcategory: "Textile Products".to_string(),
-                description: "Other textile articles, used clothing".to_string(),
-                tariff_rate: 0.14,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "64".to_string(),
-                category: "Footwear, Gaiters and the Like, and Parts of such Articles".to_string(),
-                subcategory: "Footwear".to_string(),
-                description: "Footwear and their parts".to_string(),
-                tariff_rate: 0.10,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "65".to_string(),
-                category: "Headgear and Parts Thereof".to_string(),
-                subcategory: "Headgear".to_string(),
-                description: "Headgear and their parts".to_string(),
-                tariff_rate: 0.14,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "66".to_string(),
-                category: "Umbrellas, Sun Umbrellas, Walking Sticks, Riding Crops and Whips".to_string(),
-                subcategory: "Daily Goods".to_string(),
-                description: "Umbrellas, sun umbrellas, walking sticks".to_string(),
-                tariff_rate: 0.12,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "67".to_string(),
-                category: "Prepared Feathers and Down and Articles Thereof, Artificial Flowers".to_string(),
-                subcategory: "Feather Products".to_string(),
-                description: "Feathers, down products, artificial flowers, wigs".to_string(),
-                tariff_rate: 0.15,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "68".to_string(),
-                category: "Articles of Stone, Plaster, Cement, Asbestos, Mica or Similar Materials".to_string(),
-                subcategory: "Building Materials".to_string(),
-                description: "Stone and cement products".to_string(),
-                tariff_rate: 0.08,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "69".to_string(),
-                category: "Ceramic Products".to_string(),
-                subcategory: "Ceramics".to_string(),
-                description: "Ceramic products".to_string(),
-                tariff_rate: 0.12,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "70".to_string(),
-                category: "Glass and Glassware".to_string(),
-                subcategory: "Glass Products".to_string(),
-                description: "Glass and glassware".to_string(),
-                tariff_rate: 0.12,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "71".to_string(),
-                category: "Natural or Cultured Pearls, Precious Stones, Precious Metals and their Products".to_string(),
-                subcategory: "Jewelry".to_string(),
-                description: "Jewelry, precious metals and their products".to_string(),
-                tariff_rate: 0.20,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.05,
-            },
-            HsCategory {
-                hs_code: "7108".to_string(),
-                category: "Precious Metals and their Products".to_string(),
-                subcategory: "Gold".to_string(),
-                description: "Gold, monetary and non-monetary".to_string(),
-                tariff_rate: 0.00,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.05,
-            },
-            HsCategory {
-                hs_code: "72".to_string(),
-                category: "Iron and Steel".to_string(),
-                subcategory: "Metal Materials".to_string(),
-                description: "Iron and steel raw materials".to_string(),
-                tariff_rate: 0.02,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "73".to_string(),
-                category: "Articles of Iron or Steel".to_string(),
-                subcategory: "Hardware Products".to_string(),
-                description: "Iron and steel products".to_string(),
-                tariff_rate: 0.06,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "74".to_string(),
-                category: "Copper and Articles Thereof".to_string(),
-                subcategory: "Metal Materials".to_string(),
-                description: "Copper and copper products".to_string(),
-                tariff_rate: 0.02,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "75".to_string(),
-                category: "Nickel and Articles Thereof".to_string(),
-                subcategory: "Metal Materials".to_string(),
-                description: "Nickel and nickel products".to_string(),
-                tariff_rate: 0.03,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "76".to_string(),
-                category: "Aluminium and Articles Thereof".to_string(),
-                subcategory: "Metal Materials".to_string(),
-                description: "Aluminium and aluminium products".to_string(),
-                tariff_rate: 0.05,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "78".to_string(),
-                category: "Lead and Articles Thereof".to_string(),
-                subcategory: "Metal Materials".to_string(),
-                description: "Lead and lead products".to_string(),
-                tariff_rate: 0.03,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "79".to_string(),
-                category: "Zinc and Articles Thereof".to_string(),
-                subcategory: "Metal Materials".to_string(),
-                description: "Zinc and zinc products".to_string(),
-                tariff_rate: 0.03,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "80".to_string(),
-                category: "Tin and Articles Thereof".to_string(),
-                subcategory: "Metal Materials".to_string(),
-                description: "Tin and tin products".to_string(),
-                tariff_rate: 0.04,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "81".to_string(),
-                category: "Other Base Metals, Cermets and Articles Thereof".to_string(),
-                subcategory: "Metal Materials".to_string(),
-                description: "Other base metal products".to_string(),
-                tariff_rate: 0.06,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "82".to_string(),
-                category: "Tools, Implements, Cutlery, Spoons and Forks of Base Metal".to_string(),
-                subcategory: "Hardware Products".to_string(),
-                description: "Base metal tools, tableware".to_string(),
-                tariff_rate: 0.08,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "83".to_string(),
-                category: "Miscellaneous Articles of Base Metal".to_string(),
-                subcategory: "Hardware Products".to_string(),
-                description: "Other base metal products".to_string(),
-                tariff_rate: 0.08,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "84".to_string(),
-                category: "Nuclear Reactors, Boilers, Machinery and Mechanical Appliances".to_string(),
-                subcategory: "Machinery and Equipment".to_string(),
-                description: "Nuclear reactors, boilers, machinery and mechanical appliances".to_string(),
-                tariff_rate: 0.05,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "8407".to_string(),
-                category: "Machinery and Mechanical Appliances".to_string(),
-                subcategory: "Engines".to_string(),
-                description: "Spark-ignition reciprocating internal combustion engines".to_string(),
-                tariff_rate: 0.15,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "8408".to_string(),
-                category: "Machinery and Mechanical Appliances".to_string(),
-                subcategory: "Engines".to_string(),
-                description: "Compression-ignition internal combustion engines (diesel)".to_string(),
-                tariff_rate: 0.05,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "8415".to_string(),
-                category: "Machinery and Mechanical Appliances".to_string(),
-                subcategory: "Home Appliances".to_string(),
-                description: "Air conditioners".to_string(),
-                tariff_rate: 0.15,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "8418".to_string(),
-                category: "Machinery and Mechanical Appliances".to_string(),
-                subcategory: "Home Appliances".to_string(),
-                description: "Refrigerators and freezers".to_string(),
-                tariff_rate: 0.15,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "8471".to_string(),
-                category: "Machinery and Mechanical Appliances".to_string(),
-                subcategory: "Computers".to_string(),
-                description: "Automatic data processing machines (computers)".to_string(),
-                tariff_rate: 0.00,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "85".to_string(),
-                category: "Electrical Machinery and Equipment and Parts Thereof".to_string(),
-                subcategory: "Electronic Products".to_string(),
-                description: "Electrical machinery, sound and video recorders, televisions".to_string(),
-                tariff_rate: 0.08,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "8517".to_string(),
-                category: "Electrical Machinery and Equipment".to_string(),
-                subcategory: "Communications Equipment".to_string(),
-                description: "Telephones, smartphones and other communications equipment".to_string(),
-                tariff_rate: 0.00,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "8525".to_string(),
-                category: "Electrical Machinery and Equipment".to_string(),
-                subcategory: "Camera Equipment".to_string(),
-                description: "Television cameras and digital cameras".to_string(),
-                tariff_rate: 0.00,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "8528".to_string(),
-                category: "Electrical Machinery and Equipment".to_string(),
-                subcategory: "Display Devices".to_string(),
-                description: "Television receivers and monitors".to_string(),
-                tariff_rate: 0.15,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "8534".to_string(),
-                category: "Electrical Machinery and Equipment".to_string(),
-                subcategory: "Electronic Components".to_string(),
-                description: "Printed circuits".to_string(),
-                tariff_rate: 0.00,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "8542".to_string(),
-                category: "Electrical Machinery and Equipment".to_string(),
-                subcategory: "Integrated Circuits".to_string(),
-                description: "Integrated circuits and microelectronic assemblies".to_string(),
-                tariff_rate: 0.00,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "86".to_string(),
-                category: "Railway or Tramway Locomotives, Rolling Stock and Parts Thereof".to_string(),
-                subcategory: "Rail Transport".to_string(),
-                description: "Railway vehicles and locomotives".to_string(),
-                tariff_rate: 0.03,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "87".to_string(),
-                category: "Vehicles Other Than Railway or Tramway Rolling Stock, and Parts Thereof".to_string(),
-                subcategory: "Vehicles".to_string(),
-                description: "Vehicles (other than railway) and their parts".to_string(),
-                tariff_rate: 0.15,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "8703".to_string(),
-                category: "Vehicles and Parts".to_string(),
-                subcategory: "Passenger Vehicles".to_string(),
-                description: "Motor vehicles designed primarily for the transport of persons".to_string(),
-                tariff_rate: 0.25,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.25,
-            },
-            HsCategory {
-                hs_code: "8708".to_string(),
-                category: "Vehicles and Parts".to_string(),
-                subcategory: "Auto Parts".to_string(),
-                description: "Parts and accessories for motor vehicles".to_string(),
-                tariff_rate: 0.06,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "88".to_string(),
-                category: "Aircraft, Spacecraft and Parts Thereof".to_string(),
-                subcategory: "Aerospace".to_string(),
-                description: "Aircraft, spacecraft and their parts".to_string(),
-                tariff_rate: 0.01,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "89".to_string(),
-                category: "Ships, Boats and Floating Structures".to_string(),
-                subcategory: "Ships".to_string(),
-                description: "Ships and floating structures".to_string(),
-                tariff_rate: 0.05,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "90".to_string(),
-                category: "Optical, Photographic, Cinematographic, Measuring, Medical and Surgical Instruments".to_string(),
-                subcategory: "Precision Instruments".to_string(),
-                description: "Optical instruments, medical equipment, precision instruments".to_string(),
-                tariff_rate: 0.04,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "91".to_string(),
-                category: "Clocks and Watches and Parts Thereof".to_string(),
-                subcategory: "Clocks and Watches".to_string(),
-                description: "Clocks and watches and their parts".to_string(),
-                tariff_rate: 0.12,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.20,
-            },
-            HsCategory {
-                hs_code: "92".to_string(),
-                category: "Musical Instruments and Parts and Accessories Thereof".to_string(),
-                subcategory: "Musical Instruments".to_string(),
-                description: "Musical instruments and their parts".to_string(),
-                tariff_rate: 0.17,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "93".to_string(),
-                category: "Arms and Ammunition and Parts and Accessories Thereof".to_string(),
-                subcategory: "Weapons".to_string(),
-                description: "Arms and ammunition and their parts".to_string(),
-                tariff_rate: 0.13,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "94".to_string(),
-                category: "Furniture, Bedding, Mattresses, Cushions and Similar Stuffed Furnishings".to_string(),
-                subcategory: "Furniture".to_string(),
-                description: "Furniture, bedding, lamps, prefabricated buildings".to_string(),
-                tariff_rate: 0.00,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "9401".to_string(),
-                category: "Furniture and Bedding".to_string(),
-                subcategory: "Seats".to_string(),
-                description: "Seating furniture".to_string(),
-                tariff_rate: 0.00,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "9403".to_string(),
-                category: "Furniture and Bedding".to_string(),
-                subcategory: "Furniture".to_string(),
-                description: "Other furniture".to_string(),
-                tariff_rate: 0.00,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "95".to_string(),
-                category: "Toys, Games and Sports Equipment and Parts and Accessories Thereof".to_string(),
-                subcategory: "Toys and Sports".to_string(),
-                description: "Toys, games, sports equipment".to_string(),
-                tariff_rate: 0.10,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "96".to_string(),
-                category: "Miscellaneous Manufactured Articles".to_string(),
-                subcategory: "Miscellaneous".to_string(),
-                description: "Brooms, brushes, buttons, zippers, lighters, etc".to_string(),
-                tariff_rate: 0.14,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "97".to_string(),
-                category: "Works of Art, Collectors' Pieces and Antiques".to_string(),
-                subcategory: "Artwork".to_string(),
-                description: "Works of art, collectors' pieces and antiques".to_string(),
-                tariff_rate: 0.00,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "98".to_string(),
-                category: "Special Classification Provisions and Commodities Not Elsewhere Specified".to_string(),
-                subcategory: "Special Goods".to_string(),
-                description: "Special transaction goods, unclassified commodities".to_string(),
-                tariff_rate: 0.10,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-            HsCategory {
-                hs_code: "99".to_string(),
-                category: "Special Classification Provisions and Commodities Not Elsewhere Specified".to_string(),
-                subcategory: "Special Goods".to_string(),
-                description: "Special transaction goods, unclassified commodities".to_string(),
-                tariff_rate: 0.10,
-                vat_rate: 0.13,
-                consumption_tax_rate: 0.0,
-            },
-        ]
+    fn normalize_hs_code(hs_code: &str) -> String {
+        let mut cleaned: String = hs_code
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect();
+        if cleaned.len() > 10 {
+            cleaned.truncate(10);
+        }
+        cleaned
+    }
+
+    fn find_all_matches(cleaned: &str) -> Vec<MatchCandidate> {
+        let db = get_database();
+        let mut matches: Vec<MatchCandidate> = Vec::new();
+
+        for cat in db {
+            if let Some(score) = Self::calculate_match_score(cleaned, &cat.hs_code) {
+                let match_level = if cat.hs_code.len() == cleaned.len() && cat.hs_code == cleaned {
+                    "Exact".to_string()
+                } else if cleaned.len() >= 6 && cat.hs_code.len() >= 6
+                    && cleaned[..6] == cat.hs_code[..6]
+                {
+                    "6-digit".to_string()
+                } else if cleaned.len() >= 4 && cat.hs_code.len() >= 4
+                    && cleaned[..4] == cat.hs_code[..4]
+                {
+                    "4-digit".to_string()
+                } else {
+                    "Chapter".to_string()
+                };
+
+                let common_prefix = Self::common_prefix_length(cleaned, &cat.hs_code);
+                let matched_prefix = cleaned[..common_prefix].to_string();
+
+                matches.push(MatchCandidate {
+                    category: cat,
+                    match_score: score,
+                    match_level,
+                    matched_prefix,
+                });
+            }
+        }
+
+        matches.sort_by(|a, b| {
+            b.match_score
+                .partial_cmp(&a.match_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        matches
+    }
+
+    fn calculate_match_score(input: &str, code: &str) -> Option<f64> {
+        let common = Self::common_prefix_length(input, code);
+        if common == 0 {
+            return None;
+        }
+
+        let input_len = input.len() as f64;
+        let code_len = code.len() as f64;
+        let common_len = common as f64;
+
+        let prefix_score = common_len / input_len.max(code_len);
+        let exact_match = if input == code { 1.0 } else { 0.0 };
+        let length_bonus = if common >= 6 {
+            0.2
+        } else if common >= 4 {
+            0.1
+        } else {
+            0.0
+        };
+        let specificity_bonus = if code.len() > input.len() {
+            0.0
+        } else {
+            (code_len / 10.0) * 0.15
+        };
+
+        let total = (prefix_score * 0.6) + (exact_match * 0.3) + length_bonus + specificity_bonus;
+
+        Some(total.min(1.0))
+    }
+
+    fn common_prefix_length(a: &str, b: &str) -> usize {
+        a.chars()
+            .zip(b.chars())
+            .take_while(|(x, y)| x == y)
+            .count()
+    }
+
+    fn select_best_matches(
+        mut all_matches: Vec<MatchCandidate>,
+        _input: &str,
+    ) -> (MatchCandidate, Vec<MatchCandidate>) {
+        all_matches.sort_by(|a, b| {
+            b.match_score
+                .partial_cmp(&a.match_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let primary = all_matches.remove(0);
+        let alternatives: Vec<MatchCandidate> = all_matches
+            .into_iter()
+            .filter(|m| m.match_score >= 0.3)
+            .take(3)
+            .collect();
+
+        (primary, alternatives)
+    }
+
+    fn assess_risks(
+        primary: &MatchCandidate,
+        alternatives: &[MatchCandidate],
+        input: &str,
+    ) -> Vec<TaxRisk> {
+        let mut risks: Vec<TaxRisk> = Vec::new();
+
+        if input.len() < 4 {
+            risks.push(TaxRisk {
+                risk_level: RiskLevel::High,
+                risk_type: "INSUFFICIENT_PRECISION".to_string(),
+                risk_code: "R001".to_string(),
+                description: format!(
+                    "HS code {} has insufficient digits ({}). 4+ digits required for reliable classification",
+                    input, input.len()
+                ),
+                suggestion: "Provide at least 4-digit HS code; 6-10 digits recommended for accurate tariff determination".to_string(),
+                tax_difference_potential: None,
+            });
+        } else if input.len() < 6 {
+            risks.push(TaxRisk {
+                risk_level: RiskLevel::Medium,
+                risk_type: "LOW_PRECISION".to_string(),
+                risk_code: "R002".to_string(),
+                description: format!(
+                    "HS code {} has only {} digits. Using chapter-level classification may result in incorrect rate application",
+                    input, input.len()
+                ),
+                suggestion: "Provide 6+ digit HS code for subheading-level accuracy".to_string(),
+                tax_difference_potential: None,
+            });
+        }
+
+        if primary.match_level != "Exact" && input.len() >= 4 {
+            risks.push(TaxRisk {
+                risk_level: RiskLevel::Medium,
+                risk_type: "NON_EXACT_MATCH".to_string(),
+                risk_code: "R003".to_string(),
+                description: format!(
+                    "No exact match found for HS code {}. Matched at {} level with code {}",
+                    input, primary.match_level, primary.category.hs_code
+                ),
+                suggestion: "Verify product specifications against customs tariff database to confirm correct classification".to_string(),
+                tax_difference_potential: None,
+            });
+        }
+
+        if primary.category.consumption_tax_rate > 0.0 {
+            risks.push(TaxRisk {
+                risk_level: RiskLevel::Medium,
+                risk_type: "CONSUMPTION_TAX_APPLICABLE".to_string(),
+                risk_code: "R004".to_string(),
+                description: format!(
+                    "Product category is subject to {:.1}% consumption tax, verify if any exemption applies",
+                    primary.category.consumption_tax_rate * 100.0
+                ),
+                suggestion: "Check if product qualifies for consumption tax exemption or reduced rate based on end use and customs regulations".to_string(),
+                tax_difference_potential: None,
+            });
+        }
+
+        let high_rate_categories = [
+            "Passenger Vehicles", "Tobacco Products", "Distilled Spirits",
+            "Jewelry", "Cosmetics", "Clocks and Watches",
+        ];
+        if high_rate_categories.contains(&primary.category.subcategory.as_str())
+            || high_rate_categories.contains(&primary.category.category.as_str())
+        {
+            risks.push(TaxRisk {
+                risk_level: RiskLevel::Medium,
+                risk_type: "HIGH_RATE_CATEGORY".to_string(),
+                risk_code: "R005".to_string(),
+                description: format!(
+                    "Product falls under high-duty category ({}), subject to enhanced customs scrutiny",
+                    primary.category.subcategory
+                ),
+                suggestion: "Ensure complete product documentation and value declaration are prepared; consider obtaining advance customs ruling for high-value shipments".to_string(),
+                tax_difference_potential: None,
+            });
+        }
+
+        for alt in alternatives {
+            let rate_diff = (primary.category.tariff_rate - alt.category.tariff_rate).abs()
+                + (primary.category.consumption_tax_rate - alt.category.consumption_tax_rate).abs();
+
+            if (alt.match_score - primary.match_score).abs() < 0.08 && rate_diff > 0.03 {
+                risks.push(TaxRisk {
+                    risk_level: RiskLevel::High,
+                    risk_type: "CLASSIFICATION_AMBIGUITY".to_string(),
+                    risk_code: "R006".to_string(),
+                    description: format!(
+                        "Multiple plausible classifications with significant rate difference. Primary: {} ({:.1}% tariff, {:.1}% consumption), Alternative: {} ({:.1}% tariff, {:.1}% consumption)",
+                        primary.category.subcategory,
+                        primary.category.tariff_rate * 100.0,
+                        primary.category.consumption_tax_rate * 100.0,
+                        alt.category.subcategory,
+                        alt.category.tariff_rate * 100.0,
+                        alt.category.consumption_tax_rate * 100.0,
+                    ),
+                    suggestion: format!(
+                        "Critical: Obtain official customs classification ruling or consult customs broker. Incorrect classification between these categories could result in tax underpayment penalties up to {:.1}% of CIF value",
+                        rate_diff * 100.0
+                    ),
+                    tax_difference_potential: Some(rate_diff),
+                });
+            } else if (alt.match_score - primary.match_score).abs() < 0.12
+                && rate_diff > 0.01
+            {
+                risks.push(TaxRisk {
+                    risk_level: RiskLevel::Medium,
+                    risk_type: "CLASSIFICATION_UNCERTAINTY".to_string(),
+                    risk_code: "R007".to_string(),
+                    description: format!(
+                        "Classification uncertainty: alternative category {} ({}) has similar match score with rate difference of {:.1}%",
+                        alt.category.subcategory,
+                        alt.category.hs_code,
+                        rate_diff * 100.0,
+                    ),
+                    suggestion: "Review product specifications carefully against tariff heading notes; consider requesting a binding tariff information (BTI) ruling".to_string(),
+                    tax_difference_potential: Some(rate_diff),
+                });
+            }
+        }
+
+        if primary.category.tariff_rate >= 0.20 {
+            risks.push(TaxRisk {
+                risk_level: RiskLevel::Medium,
+                risk_type: "HIGH_TARIFF".to_string(),
+                risk_code: "R008".to_string(),
+                description: format!(
+                    "Applicable tariff rate is {:.1}%, verify if preferential tariff treatment is available under applicable FTAs",
+                    primary.category.tariff_rate * 100.0
+                ),
+                suggestion: "Check eligibility for preferential rates under free trade agreements (e.g., RCEP, CAI). Proper certificate of origin may significantly reduce duty burden.".to_string(),
+                tax_difference_potential: Some(primary.category.tariff_rate * 0.5),
+            });
+        }
+
+        risks.sort_by(|a, b| {
+            let order_a = match a.risk_level {
+                RiskLevel::Critical => 0,
+                RiskLevel::High => 1,
+                RiskLevel::Medium => 2,
+                RiskLevel::Low => 3,
+            };
+            let order_b = match b.risk_level {
+                RiskLevel::Critical => 0,
+                RiskLevel::High => 1,
+                RiskLevel::Medium => 2,
+                RiskLevel::Low => 3,
+            };
+            order_a.cmp(&order_b)
+        });
+
+        risks
     }
 }
